@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use full_moon::{
-    ast::{Assignment, Ast, Block, LocalAssignment, Var},
+    ast::{
+        Assignment, Ast, Block, FunctionArgs, FunctionDeclaration, LocalAssignment, Parameter, Var,
+    },
     node::Node,
     tokenizer::Position,
     visitors::Visitor,
@@ -71,6 +73,15 @@ impl LuaAnalyserVisitor {
         });
     }
 
+    fn add_local_var(&mut self, name: String) {
+        let scope_index = self.current_scope.expect("current scope isn't set");
+        let scope = self
+            .scopes
+            .get_mut(scope_index)
+            .expect("current scope doesn't exist");
+        scope.local_vars.insert(name);
+    }
+
     fn enter_scope(&mut self) {
         self.scopes.push(Scope {
             local_vars: HashSet::new(),
@@ -128,6 +139,12 @@ impl Visitor for LuaAnalyserVisitor {
         }
     }
 
+    fn visit_local_assignment(&mut self, local_assign: &LocalAssignment) {
+        for name in local_assign.names() {
+            self.add_local_var(name.to_string().trim().to_owned());
+        }
+    }
+
     fn visit_block(&mut self, _node: &Block) {
         self.enter_scope();
     }
@@ -136,15 +153,16 @@ impl Visitor for LuaAnalyserVisitor {
         self.exit_scope();
     }
 
-    fn visit_local_assignment(&mut self, local_assign: &LocalAssignment) {
-        let scope_index = self.current_scope.expect("current scope isn't set");
-        for name in local_assign.names() {
-            let scope = self
-                .scopes
-                .get_mut(scope_index)
-                .expect("current scope doesn't exist");
-            scope.local_vars.insert(name.to_string().trim().to_owned());
+    fn visit_function_declaration(&mut self, func_dec: &FunctionDeclaration) {
+        for param in func_dec.body().parameters() {
+            if let Parameter::Name(name) = param {
+                self.add_local_var(name.token().to_string().trim().to_owned());
+            }
         }
+    }
+
+    fn visit_function_args(&mut self, args: &FunctionArgs) {
+        println!("args: {args:?}");
     }
 }
 
@@ -212,5 +230,18 @@ mod tests {
         visitor.visit_ast(&ast);
         assert_eq!(visitor.global_vars.len(), 1);
         assert_eq!(&visitor.global_vars[0].name, "z");
+    }
+
+    #[test]
+    fn function_arguments_are_locals() {
+        let code = r#"
+        function with_args(n1, n2)
+            n1 = 1
+            n2 = 2
+        end
+        "#;
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert!(analysis.global_vars.is_empty());
     }
 }
