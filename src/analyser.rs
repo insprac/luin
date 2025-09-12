@@ -1,34 +1,65 @@
+use std::collections::HashSet;
+
 use full_moon::{
-    ast::{Assignment, Ast, Var},
+    ast::{Assignment, Ast, Block, Do, LocalAssignment, Var},
     node::Node,
     tokenizer::Position,
     visitors::Visitor,
 };
+use tracing::warn;
 
 #[derive(Debug)]
-pub struct Definition {
+pub struct VariableDefinition {
     name: String,
     assign_positions: Vec<Position>,
 }
 
-pub struct LuaAnalyser {
-    definitions: Vec<Definition>,
+#[derive(Debug)]
+pub struct Scope {
+    local_vars: HashSet<String>,
+    parent: Option<usize>,
 }
 
-impl LuaAnalyser {
-    pub fn new() -> Self {
+pub struct LuaAnalysis {
+    global_vars: Vec<VariableDefinition>,
+}
+
+impl LuaAnalysis {
+    pub fn from_ast(ast: &Ast) -> Self {
+        let mut visitor = LuaAnalyserVisitor::new();
+        visitor.visit_ast(ast);
         Self {
-            definitions: Vec::new(),
+            global_vars: visitor.global_vars,
         }
     }
+}
 
-    pub fn analyse_ast(&mut self, ast: &Ast) {
-        self.visit_ast(ast);
+pub struct LuaAnalyserVisitor {
+    global_vars: Vec<VariableDefinition>,
+    scopes: Vec<Scope>,
+    current_scope: usize,
+}
+
+impl LuaAnalyserVisitor {
+    pub fn new() -> Self {
+        let mut analyser = Self {
+            global_vars: Vec::new(),
+            scopes: Vec::new(),
+            current_scope: 0,
+        };
+
+        // Add the initial scope which all nested scopes will inherit
+        analyser.scopes.push(Scope {
+            local_vars: HashSet::new(),
+            parent: None,
+        });
+
+        analyser
     }
 
-    fn add_definition(&mut self, name: String, position: Option<Position>) {
+    fn add_global_var(&mut self, name: String, position: Option<Position>) {
         // If a registered definition matches they are merged
-        for existing_def in &mut self.definitions {
+        for existing_def in &mut self.global_vars {
             if existing_def.name != name {
                 continue;
             }
@@ -38,17 +69,43 @@ impl LuaAnalyser {
             return;
         }
         // If there is no matching definition add a new one
-        self.definitions.push(Definition {
+        self.global_vars.push(VariableDefinition {
             name,
             assign_positions: match position {
                 Some(pos) => vec![pos],
-                None => vec![]
+                None => vec![],
             },
         });
     }
+
+    fn enter_scope(&mut self) {
+        self.scopes.push(Scope {
+            local_vars: HashSet::new(),
+            parent: Some(self.current_scope),
+        });
+        self.current_scope = self.scopes.len() - 1;
+    }
+
+    fn exit_scope(&mut self) {
+        let Some(scope) = self.scopes.get(self.current_scope) else {
+            warn!(
+                scope_id = self.current_scope,
+                "Attempting to exit scope, but current scope not found"
+            );
+            return;
+        };
+        let Some(parent_scope) = scope.parent else {
+            warn!(
+                ?scope,
+                "Attempting to exit scope, but current scope has no parent"
+            );
+            return;
+        };
+        self.current_scope = parent_scope;
+    }
 }
 
-impl Visitor for LuaAnalyser {
+impl Visitor for LuaAnalyserVisitor {
     fn visit_assignment(&mut self, assignment: &Assignment) {
         for var in assignment.variables() {
             let Var::Name(name_token) = var else {
@@ -56,27 +113,40 @@ impl Visitor for LuaAnalyser {
                 continue;
             };
             let name_string = name_token.token().to_string();
-            self.add_definition(name_string, var.start_position());
+            self.add_global_var(name_string, var.start_position());
+        }
+    }
+
+    fn visit_block(&mut self, _node: &Block) {
+        self.enter_scope();
+    }
+
+    fn visit_block_end(&mut self, _node: &Block) {
+        self.exit_scope();
+    }
+
+    fn visit_local_assignment(&mut self, local_assign: &LocalAssignment) {
+        for name in local_assign.names() {
+            let scope = self
+                .scopes
+                .get_mut(self.current_scope)
+                .expect("Current scope doesn't exist");
+            scope.local_vars.insert(name.to_string());
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::LuaAnalyser;
-
-    fn analyse(code: &str) -> LuaAnalyser {
-        let ast = full_moon::parse(code).unwrap();
-        let mut analyser = LuaAnalyser::new();
-        analyser.analyse_ast(&ast);
-        analyser
-    }
+    use super::LuaAnalysis;
+    use full_moon::parse;
 
     #[test]
     fn indexes_global_defs() {
-        let analyser = analyse("x = 123");
-        assert_eq!(analyser.definitions.len(), 1);
-        assert_eq!(&analyser.definitions[0].name, "x");
+        let ast = parse("x = 123").unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_vars.len(), 1);
+        assert_eq!(&analysis.global_vars[0].name, "x");
     }
 
     #[test]
@@ -87,9 +157,10 @@ mod tests {
         z.b.a = 3
         z.c = 4
         "#;
-        let analyser = analyse(code);
-        assert_eq!(analyser.definitions.len(), 1);
-        assert_eq!(&analyser.definitions[0].name, "y");
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_vars.len(), 1);
+        assert_eq!(&analysis.global_vars[0].name, "y");
     }
 
     #[test]
@@ -105,9 +176,9 @@ mod tests {
             end
         end
         "#;
-
-        let analyser = analyse(code);
-        assert_eq!(analyser.definitions.len(), 1);
-        assert_eq!(&analyser.definitions[0].name, "y");
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_vars.len(), 1);
+        assert_eq!(&analysis.global_vars[0].name, "y");
     }
 }
