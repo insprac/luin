@@ -29,20 +29,20 @@ pub struct VariableDefinition {
 }
 
 #[derive(Debug)]
-pub struct Scope {
+struct Scope {
     local_vars: HashSet<String>,
     parent: Option<usize>,
 }
 
 #[derive(Debug)]
-pub struct LuaAnalyserVisitor {
+struct LuaAnalyserVisitor {
     global_vars: Vec<VariableDefinition>,
     scopes: Vec<Scope>,
     current_scope: Option<usize>,
 }
 
 impl LuaAnalyserVisitor {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             global_vars: Vec::new(),
             scopes: Vec::new(),
@@ -210,7 +210,6 @@ mod tests {
         let ast = parse(code).unwrap();
         let mut visitor = LuaAnalyserVisitor::new();
         visitor.visit_ast(&ast);
-        println!("{visitor:?}");
         assert_eq!(visitor.global_vars.len(), 1);
         assert_eq!(&visitor.global_vars[0].name, "z");
     }
