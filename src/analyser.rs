@@ -1,24 +1,12 @@
 use std::collections::HashSet;
 
 use full_moon::{
-    ast::{Assignment, Ast, Block, Do, LocalAssignment, Var},
+    ast::{Assignment, Ast, Block, LocalAssignment, Var},
     node::Node,
     tokenizer::Position,
     visitors::Visitor,
 };
 use tracing::warn;
-
-#[derive(Debug)]
-pub struct VariableDefinition {
-    name: String,
-    assign_positions: Vec<Position>,
-}
-
-#[derive(Debug)]
-pub struct Scope {
-    local_vars: HashSet<String>,
-    parent: Option<usize>,
-}
 
 pub struct LuaAnalysis {
     global_vars: Vec<VariableDefinition>,
@@ -34,27 +22,32 @@ impl LuaAnalysis {
     }
 }
 
+#[derive(Debug)]
+pub struct VariableDefinition {
+    name: String,
+    assign_positions: Vec<Position>,
+}
+
+#[derive(Debug)]
+pub struct Scope {
+    local_vars: HashSet<String>,
+    parent: Option<usize>,
+}
+
+#[derive(Debug)]
 pub struct LuaAnalyserVisitor {
     global_vars: Vec<VariableDefinition>,
     scopes: Vec<Scope>,
-    current_scope: usize,
+    current_scope: Option<usize>,
 }
 
 impl LuaAnalyserVisitor {
     pub fn new() -> Self {
-        let mut analyser = Self {
+        Self {
             global_vars: Vec::new(),
             scopes: Vec::new(),
-            current_scope: 0,
-        };
-
-        // Add the initial scope which all nested scopes will inherit
-        analyser.scopes.push(Scope {
-            local_vars: HashSet::new(),
-            parent: None,
-        });
-
-        analyser
+            current_scope: None,
+        }
     }
 
     fn add_global_var(&mut self, name: String, position: Option<Position>) {
@@ -81,15 +74,16 @@ impl LuaAnalyserVisitor {
     fn enter_scope(&mut self) {
         self.scopes.push(Scope {
             local_vars: HashSet::new(),
-            parent: Some(self.current_scope),
+            parent: self.current_scope,
         });
-        self.current_scope = self.scopes.len() - 1;
+        self.current_scope = Some(self.scopes.len() - 1);
     }
 
     fn exit_scope(&mut self) {
-        let Some(scope) = self.scopes.get(self.current_scope) else {
+        let scope_index = self.current_scope.expect("current scope isn't set");
+        let Some(scope) = self.scopes.get(scope_index) else {
             warn!(
-                scope_id = self.current_scope,
+                scope_index = self.current_scope,
                 "Attempting to exit scope, but current scope not found"
             );
             return;
@@ -101,7 +95,22 @@ impl LuaAnalyserVisitor {
             );
             return;
         };
-        self.current_scope = parent_scope;
+        self.current_scope = Some(parent_scope);
+    }
+
+    fn is_local(&mut self, name: &str) -> bool {
+        let mut scope_index = self.current_scope.expect("current scope isn't set");
+        loop {
+            let scope = self.scopes.get(scope_index).expect("scope doesn't exist");
+            if scope.local_vars.contains(name) {
+                return true;
+            }
+            let Some(parent_scope) = scope.parent else {
+                break;
+            };
+            scope_index = parent_scope;
+        }
+        false
     }
 }
 
@@ -112,8 +121,10 @@ impl Visitor for LuaAnalyserVisitor {
                 // Skip expression assignment for now e.g. `x.y = 123` and `x.y.z() = 321`
                 continue;
             };
-            let name_string = name_token.token().to_string();
-            self.add_global_var(name_string, var.start_position());
+            let name = name_token.token().to_string().trim().to_owned();
+            if !self.is_local(&name) {
+                self.add_global_var(name, var.start_position());
+            }
         }
     }
 
@@ -126,20 +137,23 @@ impl Visitor for LuaAnalyserVisitor {
     }
 
     fn visit_local_assignment(&mut self, local_assign: &LocalAssignment) {
+        let scope_index = self.current_scope.expect("current scope isn't set");
         for name in local_assign.names() {
             let scope = self
                 .scopes
-                .get_mut(self.current_scope)
-                .expect("Current scope doesn't exist");
-            scope.local_vars.insert(name.to_string());
+                .get_mut(scope_index)
+                .expect("current scope doesn't exist");
+            scope.local_vars.insert(name.to_string().trim().to_owned());
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::analyser::LuaAnalyserVisitor;
+
     use super::LuaAnalysis;
-    use full_moon::parse;
+    use full_moon::{parse, visitors::Visitor};
 
     #[test]
     fn indexes_global_defs() {
@@ -180,5 +194,24 @@ mod tests {
         let analysis = LuaAnalysis::from_ast(&ast);
         assert_eq!(analysis.global_vars.len(), 1);
         assert_eq!(&analysis.global_vars[0].name, "y");
+    }
+
+    #[test]
+    fn reassigned_locals_are_not_globals() {
+        let code = r#"local x = 1;
+        local y = 2;
+        x = 3;
+        function test()
+            x = 4;
+            y = 5;
+            z = 6;
+        end
+        "#;
+        let ast = parse(code).unwrap();
+        let mut visitor = LuaAnalyserVisitor::new();
+        visitor.visit_ast(&ast);
+        println!("{visitor:?}");
+        assert_eq!(visitor.global_vars.len(), 1);
+        assert_eq!(&visitor.global_vars[0].name, "z");
     }
 }
