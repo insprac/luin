@@ -1,17 +1,20 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use full_moon::{
     ast::{
-        Assignment, Ast, Block, FunctionArgs, FunctionDeclaration, LocalAssignment, Parameter, Var,
+        Assignment, Ast, Block, Expression, FunctionArgs, FunctionCall, FunctionDeclaration,
+        LocalAssignment, LocalFunction, Parameter, Prefix, Var,
     },
     node::Node,
-    tokenizer::Position,
+    tokenizer::{Position, Token, TokenReference},
     visitors::Visitor,
 };
 use tracing::warn;
 
+#[derive(Debug)]
 pub struct LuaAnalysis {
     global_vars: Vec<VariableDefinition>,
+    global_usages: HashMap<String, Vec<Position>>,
 }
 
 impl LuaAnalysis {
@@ -20,6 +23,7 @@ impl LuaAnalysis {
         visitor.visit_ast(ast);
         Self {
             global_vars: visitor.global_vars,
+            global_usages: visitor.global_usages,
         }
     }
 }
@@ -39,6 +43,7 @@ struct Scope {
 #[derive(Debug)]
 struct LuaAnalyserVisitor {
     global_vars: Vec<VariableDefinition>,
+    global_usages: HashMap<String, Vec<Position>>,
     scopes: Vec<Scope>,
     current_scope: Option<usize>,
 }
@@ -47,12 +52,17 @@ impl LuaAnalyserVisitor {
     fn new() -> Self {
         Self {
             global_vars: Vec::new(),
+            global_usages: HashMap::new(),
             scopes: Vec::new(),
             current_scope: None,
         }
     }
 
     fn add_global_var(&mut self, name: String, position: Option<Position>) {
+        // Ignore if this a reassignment of a local variable
+        if self.is_local(&name) {
+            return;
+        }
         // If a registered definition matches they are merged
         for existing_def in &mut self.global_vars {
             if existing_def.name != name {
@@ -80,6 +90,17 @@ impl LuaAnalyserVisitor {
             .get_mut(scope_index)
             .expect("current scope doesn't exist");
         scope.local_vars.insert(name);
+    }
+
+    fn add_global_usage(&mut self, name: String, position: Position) {
+        // Ignore local variables
+        if self.is_local(&name) {
+            return;
+        }
+        self.global_usages
+            .entry(name)
+            .and_modify(|usages| usages.push(position))
+            .or_insert(vec![position]);
     }
 
     fn enter_scope(&mut self) {
@@ -161,8 +182,48 @@ impl Visitor for LuaAnalyserVisitor {
         }
     }
 
-    fn visit_function_args(&mut self, args: &FunctionArgs) {
-        println!("args: {args:?}");
+    fn visit_local_function(&mut self, local_func: &LocalFunction) {
+        self.add_local_var(local_func.name().token().to_string().trim().to_owned());
+        for param in local_func.body().parameters() {
+            if let Parameter::Name(name) = param {
+                self.add_local_var(name.token().to_string().trim().to_owned());
+            }
+        }
+    }
+
+    fn visit_expression(&mut self, expr: &Expression) {
+        match expr {
+            Expression::Var(var) => match var {
+                Var::Name(token_ref) => {
+                    let token = token_ref.token();
+                    self.add_global_usage(
+                        token.to_string().trim().to_owned(),
+                        token.start_position(),
+                    );
+                }
+                Var::Expression(_var_expr) => {
+                    todo!();
+                }
+                _ => {}
+            },
+            Expression::FunctionCall(func_call) => {
+                if let Some(position) = func_call.start_position() {
+                    self.add_global_usage(
+                        func_call.prefix().to_string().trim().to_owned(),
+                        position,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_function_call(&mut self, func_call: &FunctionCall) {
+        let Some(position) = func_call.start_position() else {
+            // If there is no position we can't provide useful data so ignore it
+            return;
+        };
+        self.add_global_usage(func_call.prefix().to_string().trim().to_owned(), position);
     }
 }
 
@@ -222,7 +283,7 @@ mod tests {
         function test()
             x = 4;
             y = 5;
-            z = 6;
+            z = x;
         end
         "#;
         let ast = parse(code).unwrap();
@@ -236,12 +297,47 @@ mod tests {
     fn function_arguments_are_locals() {
         let code = r#"
         function with_args(n1, n2)
-            n1 = 1
-            n2 = 2
+            n1 = 1;
+            n2 = 2;
         end
         "#;
         let ast = parse(code).unwrap();
         let analysis = LuaAnalysis::from_ast(&ast);
         assert!(analysis.global_vars.is_empty());
+    }
+
+    #[test]
+    fn includes_all_global_usages() {
+        let code = r#"
+        x = 1;
+        y = 2;
+        local z = 3;
+        function example()
+            z = x + y;
+            print(x);
+            z = x;
+        end
+        "#;
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_usages.keys().len(), 3);
+        assert_eq!(analysis.global_usages.get("x").unwrap().len(), 3);
+        assert_eq!(analysis.global_usages.get("y").unwrap().len(), 1);
+        assert_eq!(analysis.global_usages.get("print").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn local_function_usages_are_ignored() {
+        let code = r#"
+        local function example(y)
+            print(y);
+        end
+        example();
+        "#;
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert!(analysis.global_vars.is_empty());
+        assert_eq!(analysis.global_usages.keys().len(), 1);
+        assert_eq!(analysis.global_usages.get("print").unwrap().len(), 1);
     }
 }
