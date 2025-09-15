@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use full_moon::{
     ast::{
-        Assignment, Ast, Block, Expression, FunctionArgs, FunctionCall, FunctionDeclaration,
-        LocalAssignment, LocalFunction, Parameter, Prefix, Var,
+        Assignment, Ast, Block, Expression, FunctionCall, FunctionDeclaration, GenericFor,
+        LocalAssignment, LocalFunction, NumericFor, Parameter, Var,
     },
     node::Node,
-    tokenizer::{Position, Token, TokenReference},
+    tokenizer::Position,
     visitors::Visitor,
 };
 use tracing::warn;
@@ -46,8 +46,8 @@ struct LuaAnalyserVisitor {
     global_usages: HashMap<String, Vec<Position>>,
     scopes: Vec<Scope>,
     current_scope: Option<usize>,
-    /// Temporarily holds function params for when the next scope is created.
-    params_awaiting_scope: HashSet<String>,
+    /// Temporarily holds function params and for loop vars until the next scope is created.
+    vars_awaiting_scope: HashSet<String>,
 }
 
 impl LuaAnalyserVisitor {
@@ -57,7 +57,7 @@ impl LuaAnalyserVisitor {
             global_usages: HashMap::new(),
             scopes: Vec::new(),
             current_scope: None,
-            params_awaiting_scope: HashSet::new(),
+            vars_awaiting_scope: HashSet::new(),
         }
     }
 
@@ -113,7 +113,7 @@ impl LuaAnalyserVisitor {
         });
         self.current_scope = Some(self.scopes.len() - 1);
         // Move temporary params into local vars
-        let params = std::mem::take(&mut self.params_awaiting_scope);
+        let params = std::mem::take(&mut self.vars_awaiting_scope);
         for param in params {
             self.add_local_var(param);
         }
@@ -185,7 +185,8 @@ impl Visitor for LuaAnalyserVisitor {
     fn visit_function_declaration(&mut self, func_dec: &FunctionDeclaration) {
         for param in func_dec.body().parameters() {
             if let Parameter::Name(name) = param {
-                self.params_awaiting_scope.insert(name.token().to_string().trim().to_owned());
+                self.vars_awaiting_scope
+                    .insert(name.token().to_string().trim().to_owned());
             }
         }
     }
@@ -194,7 +195,8 @@ impl Visitor for LuaAnalyserVisitor {
         self.add_local_var(local_func.name().token().to_string().trim().to_owned());
         for param in local_func.body().parameters() {
             if let Parameter::Name(name) = param {
-                self.params_awaiting_scope.insert(name.token().to_string().trim().to_owned());
+                self.vars_awaiting_scope
+                    .insert(name.token().to_string().trim().to_owned());
             }
         }
     }
@@ -232,6 +234,24 @@ impl Visitor for LuaAnalyserVisitor {
             return;
         };
         self.add_global_usage(func_call.prefix().to_string().trim().to_owned(), position);
+    }
+
+    fn visit_generic_for(&mut self, generic_for: &GenericFor) {
+        for name in generic_for.names() {
+            self.vars_awaiting_scope
+                .insert(name.token().to_string().trim().to_owned());
+        }
+    }
+
+    fn visit_numeric_for(&mut self, numeric_for: &NumericFor) {
+        self.vars_awaiting_scope.insert(
+            numeric_for
+                .index_variable()
+                .token()
+                .to_string()
+                .trim()
+                .to_owned(),
+        );
     }
 }
 
@@ -368,4 +388,64 @@ mod tests {
         assert_eq!(analysis.global_usages.get("x").unwrap().len(), 1);
     }
 
+    #[test]
+    fn numeric_for_loop_var_is_local() {
+        let code = r#"
+        for x = 1, 10, 1 do
+            print(x);
+        end
+        "#;
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_vars.len(), 0);
+        assert_eq!(analysis.global_usages.get("x"), None);
+    }
+
+    #[test]
+    fn generic_for_loop_var_is_local() {
+        let code = r#"
+        t = {"a", "b", "c"};
+        for k in pairs(t) do
+            print(k);
+        end
+        for i, v in ipairs(t) do
+            print(i);
+            print(v);
+        end
+        "#;
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_vars.len(), 1);
+        assert_eq!(analysis.global_usages.get("k"), None);
+        assert_eq!(analysis.global_usages.get("i"), None);
+        assert_eq!(analysis.global_usages.get("v"), None);
+    }
+
+    #[test]
+    fn for_loop_var_correctly_scoped() {
+        let code = r#"
+        t = {"a", "b", "c"};
+        for k in pairs(t) do
+            print(k);
+        end
+        for i, v in ipairs(t) do
+            print(i);
+            print(v);
+        end
+        for n = 1, 5, 1 do
+            print(n);
+        end
+        print(k);
+        print(i);
+        print(v);
+        print(n);
+        "#;
+        let ast = parse(code).unwrap();
+        let analysis = LuaAnalysis::from_ast(&ast);
+        assert_eq!(analysis.global_vars.len(), 1);
+        assert_eq!(analysis.global_usages.get("k").unwrap().len(), 1);
+        assert_eq!(analysis.global_usages.get("i").unwrap().len(), 1);
+        assert_eq!(analysis.global_usages.get("v").unwrap().len(), 1);
+        assert_eq!(analysis.global_usages.get("n").unwrap().len(), 1);
+    }
 }
